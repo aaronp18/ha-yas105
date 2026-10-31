@@ -1,6 +1,6 @@
 [project]
 name = "ha-yas105"
-version = "0.1.0"
+version = "0.2.0"
 description = "Control a Yamaha YAS-105 soundbar from Home Assistant over Bluetooth RFCOMM and MQTT"
 readme = "README.md"
 authors = [

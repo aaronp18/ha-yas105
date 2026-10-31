@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from ha_yas105.config import SystemConfig
-from ha_yas105.main import Main, build_parser, get_version, main
+from ha_yas105.main import DEFAULT_PROBE_TIMEOUT, Main, build_parser, get_version, main
 
 
 def test_parser_accepts_version():
@@ -41,7 +41,122 @@ def test_help_prints_usage_without_loading_config(capsys, monkeypatch):
 def test_main_loads_config_on_construction(isolated_system_config):
     Main()
 
-    assert SystemConfig.config == {"settings": {"test": True}}
+    assert SystemConfig.config["settings"] == {"test": True}
+    assert SystemConfig.config["soundbar"] == {
+        "bluetooth_address": "",
+        "rfcomm_channel": 1,
+    }
+
+
+def test_parser_accepts_probe_defaults():
+    args = build_parser().parse_args(["probe"])
+
+    assert args.command == "probe"
+    assert args.address is None
+    assert args.channel is None
+    assert args.timeout == DEFAULT_PROBE_TIMEOUT
+    assert args.dry_run is False
+
+
+def test_probe_without_address_asks_for_one(isolated_system_config):
+    args = build_parser().parse_args(["probe"])
+
+    assert Main().runProbe(args) == 2
+
+
+def test_probe_dry_run_never_opens_bluetooth(isolated_system_config, monkeypatch):
+    captured = {}
+
+    class FakeProbe:
+        def __init__(self, transport, timeout):
+            captured["transport"] = transport
+            captured["timeout"] = timeout
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr("ha_yas105.main.ProtocolProbe", FakeProbe)
+
+    args = build_parser().parse_args(["probe", "--dry-run"])
+
+    assert Main().runProbe(args) == 0
+    assert captured["transport"].isDryRun is True
+    assert captured["timeout"] == DEFAULT_PROBE_TIMEOUT
+
+
+def test_probe_uses_command_line_overrides(isolated_system_config, monkeypatch):
+    captured = {}
+
+    class FakeTransport:
+        def __init__(self, address, channel, timeout):
+            captured.update(address=address, channel=channel, timeout=timeout)
+
+    class FakeProbe:
+        def __init__(self, transport, timeout):
+            self.transport = transport
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr("ha_yas105.main.RfcommTransport", FakeTransport)
+    monkeypatch.setattr("ha_yas105.main.ProtocolProbe", FakeProbe)
+
+    args = build_parser().parse_args(
+        [
+            "probe",
+            "--address",
+            "AA:BB:CC:DD:EE:FF",
+            "--channel",
+            "3",
+            "--timeout",
+            "0.5",
+        ]
+    )
+
+    assert Main().runProbe(args) == 0
+    assert captured == {
+        "address": "AA:BB:CC:DD:EE:FF",
+        "channel": 3,
+        "timeout": 0.5,
+    }
+
+
+def test_probe_falls_back_to_the_configured_address(
+    isolated_system_config, monkeypatch
+):
+    captured = {}
+
+    class FakeTransport:
+        def __init__(self, address, channel, timeout):
+            captured.update(address=address, channel=channel, timeout=timeout)
+
+    class FakeProbe:
+        def __init__(self, transport, timeout):
+            self.transport = transport
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr("ha_yas105.main.RfcommTransport", FakeTransport)
+    monkeypatch.setattr("ha_yas105.main.ProtocolProbe", FakeProbe)
+
+    app = Main()
+    # Set the config *after* construction: Main() reloads it from disk.
+    monkeypatch.setattr(
+        SystemConfig,
+        "config",
+        {
+            "settings": {"test": True},
+            "soundbar": {
+                "bluetooth_address": "AA:BB:CC:DD:EE:FF",
+                "rfcomm_channel": 4,
+            },
+        },
+    )
+
+    assert app.runProbe(build_parser().parse_args(["probe"])) == 0
+    assert captured["address"] == "AA:BB:CC:DD:EE:FF"
+    assert captured["channel"] == 4
 
 
 def test_get_version_returns_project_version():

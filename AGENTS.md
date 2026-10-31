@@ -16,9 +16,11 @@ A bridge between a **Yamaha YAS-105 soundbar** and **Home Assistant**.
   access to the host Bluetooth stack (`/var/run/dbus` socket, and in some setups the
   HCI device).
 
-Status: **early scaffold**. Today `src/ha_yas105` only contains the CLI entry point and
-the config loader. The RFCOMM transport, the MQTT bridge and the Docker image are still
-to be written. Do not claim a feature exists unless the code for it is in `src/`.
+Status: **early scaffold with a protocol lab tool.** `src/ha_yas105` contains the CLI
+entry point, the config loader, a first RFCOMM transport, a hypothesised protocol codec
+(`protocol.py`) and the `probe` menu (`probe.py`). The protocol itself is **not**
+confirmed; the MQTT bridge and the Docker image are still to be written. Do not claim a
+feature exists unless the code for it is in `src/`.
 
 ## Golden rules
 
@@ -59,6 +61,8 @@ to be written. Do not claim a feature exists unless the code for it is in `src/`
 | Format | `uv run ruff format .` |
 | Show version | `uv run ha-yas105 version` |
 | Show CLI help | `uv run ha-yas105 help` |
+| Probe frames offline (no Bluetooth) | `uv run ha-yas105 probe --dry-run` |
+| Probe the real soundbar | `uv run ha-yas105 probe --address <MAC> --channel <N>` |
 | Build/run container | `docker compose build` / `docker compose up -d` |
 
 `uv run` is preferred over activating `.venv` so commands work identically for humans
@@ -71,16 +75,30 @@ also be run as `uv run python -m ha_yas105.main`.
 src/ha_yas105/
   __init__.py          Package docstring only (no entry point; keep it that way)
   main.py              CLI: build_parser(), main(argv, app=None), Main (config bootstrap,
-                       command dispatch), get_version()
-  config.py            SystemConfig: default config, load/create/merge ./config/config.yaml
+                       command dispatch), runProbe(), get_version()
+  config.py            SystemConfig: default config, load/create/merge ./config/config.yaml,
+                       getSoundbarSettings()
+  protocol.py          Hypothesised frame codec: buildRequestFrame(), parseStatusFrame(),
+                       FrameReader (stream -> frames), COMMANDS table, SoundbarState
+  probe.py             ProtocolProbe (numbered terminal menu) + DryRunTransport
+  transport/
+    __init__.py        Package docstring only
+    rfcomm.py          RfcommTransport + defaultSocketFactory() (Bluetooth Classic RFCOMM),
+                       TransportError
 tests/
   conftest.py          isolated_system_config fixture (temp CWD + patched config path)
-  test_cli.py          parser, help/version short-circuit, version consistency
-  test_config.py       defaults, merge, invalid YAML
+  test_cli.py          parser, help/version short-circuit, version consistency, probe wiring
+  test_config.py       defaults, merge, invalid YAML, soundbar settings
+  test_protocol.py     frame building/parsing, checksum rule, FrameReader resync
+  test_probe.py        menu behaviour against DryRunTransport + fake input
+  test_transport.py    RfcommTransport against a fake socket/factory
 config/
   config.example.yaml  Tracked schema sample (copy to config/config.yaml)
 docs/
   protocol.md          Reverse-engineered RFCOMM notes: what is known and what is open
+  yamaha_yas_105_bluetooth_protocol_spec.md
+                       Gemini-derived protocol hypothesis. Untrusted source material;
+                       `protocol.py` is a direct transcription of it.
 ```
 
 Data flow (target design):
@@ -92,14 +110,26 @@ Home Assistant  <--MQTT discovery/state-->  bridge (this repo)  <--RFCOMM-->  YA
 `main()` → `Main.handleCommand()` → (future) MQTT bridge → (future) RFCOMM transport →
 soundbar. State read from the soundbar is published back to MQTT.
 
+Current data flow (`probe` only):
+
+```text
+stdin (menu) -> ProtocolProbe -> transport (RfcommTransport | DryRunTransport) -> stdout
+```
+
 
 ## Config contract
 
 ```yaml
 settings:
     test: true   # scaffold placeholder, not a real feature flag
+
+soundbar:
+    bluetooth_address: ""   # MAC of the soundbar; may also be passed as --address
+    rfcomm_channel: 1       # SPP channel; confirm with `sdptool browse <MAC>`
 ```
 
+- `SystemConfig.getSoundbarSettings()` is the only reader of the `soundbar` section; it
+  strips the address and falls back to `rfcomm_channel: 1` when the value is not an int.
 - `SystemConfig.CONFIG_FILE_PATH` is `./config/config.yaml`, relative to CWD. Docker runs
   with `WORKDIR /app` and mounts `./config` at `/app/config`.
 - If the file is missing, `getConfigFromFile()` calls `setDefaults()` and writes it.
@@ -132,9 +162,10 @@ settings:
 
 - `SystemConfig` is a process-wide static class. Avoid adding more mutable module-level
   state; prefer passing values into functions.
-- `Main.handleCommand()` is a placeholder: only `help` and `version` subcommands exist and
-  both are handled in `main()` **before** `Main` is constructed, so nothing currently
-  reaches the dispatch. Add real subcommands there when the bridge lands.
+- `Main.handleCommand()` only dispatches `probe`. `help` and `version` are handled in
+  `main()` **before** `Main` is constructed so they stay side-effect free; `Main()` does
+  reload the config from disk, so tests that need a specific config must patch
+  `SystemConfig.config` *after* constructing `Main`.
 - The version lives in three places: `pyproject.toml`, `SystemConfig.VERSION` and the
   fallback inside `SystemConfig.loadVersion()`. They must agree. `get_version()` prefers
   installed package metadata and only falls back to the constant; the test compares
@@ -150,6 +181,15 @@ settings:
   (CI uses `uv sync --locked`).
 - `docs/protocol.md` is the only trustworthy source for the soundbar protocol. Several
   commands are still unknown; see the open questions there.
+- `protocol.py` is a transcription of an AI-generated spec
+  (`docs/yamaha_yas_105_bluetooth_protocol_spec.md`), **not** verified protocol. Do not
+  build MQTT/HA behaviour on it until the frames are confirmed with `ha-yas105 probe` and
+  recorded in `docs/protocol.md`. The spec contradicts itself about the checksum; see the
+  module docstring for the rule that matches its own command table.
+- `socket.AF_BLUETOOTH` does not exist on every platform (e.g. WSL without Bluetooth), so
+  `defaultSocketFactory()` raises `TransportError` there — the probe then tells the user to
+  run on Linux with BlueZ or use `--dry-run`. Tests fake the socket module instead of
+  checking platform support.
 
 ## Adding a feature (recipe)
 

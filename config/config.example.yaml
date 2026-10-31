@@ -7,3 +7,12 @@
 settings:
     # Placeholder flag used by the scaffold tests; safe to ignore.
     test: true
+
+soundbar:
+    # Bluetooth MAC address of the soundbar, e.g. "AA:BB:CC:DD:EE:FF".
+    # Leave empty and pass --address to `ha-yas105 probe` if you prefer.
+    bluetooth_address: ""
+    # RFCOMM (SPP) channel. The protocol spec guesses 1; confirm it on the host with
+    # `sdptool browse <MAC>` (look for "Serial Port" / 0x1101).
+    rfcomm_channel: 1
+

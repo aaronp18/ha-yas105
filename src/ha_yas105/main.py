@@ -4,9 +4,13 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as metadata_version
 
 from ha_yas105.config import SystemConfig
+from ha_yas105.probe import DryRunTransport, ProtocolProbe
+from ha_yas105.transport.rfcomm import RfcommTransport
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+DEFAULT_PROBE_TIMEOUT = 2.0
 
 
 class Main:
@@ -18,12 +22,34 @@ class Main:
 
         SystemConfig.loadFromConfigFile()
 
-    def handleCommand(self, args: argparse.Namespace):
+    def handleCommand(self, args: argparse.Namespace) -> int:
         match args.command:
-            case "xxx":
-                pass
+            case "probe":
+                return self.runProbe(args)
             case _:
-                pass
+                return 0
+
+    def runProbe(self, args: argparse.Namespace) -> int:
+        """Open the interactive button menu against the soundbar."""
+        settings = SystemConfig.getSoundbarSettings()
+        address = (args.address or settings["bluetooth_address"]).strip()
+        channel = (
+            args.channel if args.channel is not None else settings["rfcomm_channel"]
+        )
+        timeout = args.timeout
+
+        if args.dry_run:
+            transport: object = DryRunTransport()
+        else:
+            if not address:
+                logger.error(
+                    "[Probe] No Bluetooth address. Set soundbar.bluetooth_address in"
+                    " config/config.yaml or pass --address, or use --dry-run."
+                )
+                return 2
+            transport = RfcommTransport(address, channel, timeout=timeout)
+
+        return ProtocolProbe(transport, timeout=timeout).run()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +64,36 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("help", help="Gets help")
 
     subparsers.add_parser("version", help="Prints the version of the program")
+
+    probe = subparsers.add_parser(
+        "probe",
+        help="Interactive terminal menu to test protocol frames on the soundbar",
+        description=(
+            "Interactive menu: pick a button, send the frame from the (unverified)"
+            " protocol spec, print whatever comes back. Record findings in"
+            " docs/protocol.md."
+        ),
+    )
+    probe.add_argument(
+        "--address",
+        help="Soundbar Bluetooth MAC, overrides soundbar.bluetooth_address",
+    )
+    probe.add_argument(
+        "--channel",
+        type=int,
+        help="RFCOMM channel, overrides soundbar.rfcomm_channel (default 1)",
+    )
+    probe.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_PROBE_TIMEOUT,
+        help=f"Seconds to wait for a response frame (default {DEFAULT_PROBE_TIMEOUT})",
+    )
+    probe.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only print the frames that would be sent; no Bluetooth, no soundbar",
+    )
 
     return parser
 
@@ -68,8 +124,8 @@ def main(argv: list[str] | None = None, app: Main | None = None) -> int:
         parser.print_help()
         return 0
 
-    (app or Main()).handleCommand(args)
-    return 0
+    # Commands that talk to the soundbar load the configuration first.
+    return (app or Main()).handleCommand(args)
 
 
 if __name__ == "__main__":

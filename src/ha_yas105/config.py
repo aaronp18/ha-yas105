@@ -32,6 +32,30 @@ class SystemConfig:
             "settings": {
                 "test": SystemConfig._TEST_DEFAULT,
             },
+            "soundbar": {
+                # Bluetooth MAC of the soundbar, e.g. "AA:BB:CC:DD:EE:FF".
+                # Empty means "pass --address to `ha-yas105 probe`".
+                "bluetooth_address": "",
+                # RFCOMM (SPP) channel; the protocol spec guesses 1.
+                "rfcomm_channel": 1,
+            },
+        }
+
+    @staticmethod
+    def getSoundbarSettings() -> dict:
+        """Return the soundbar section with usable defaults filled in."""
+        soundbar = SystemConfig.config.get("soundbar") or {}
+        try:
+            channel = int(soundbar.get("rfcomm_channel") or 1)
+        except TypeError, ValueError:
+            logger_mp.warning(
+                "[Config] Invalid rfcomm_channel %r, using 1",
+                soundbar.get("rfcomm_channel"),
+            )
+            channel = 1
+        return {
+            "bluetooth_address": str(soundbar.get("bluetooth_address") or "").strip(),
+            "rfcomm_channel": channel,
         }
 
     @staticmethod
