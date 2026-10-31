@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime output and local state
+*.pkl
+logs/
+*.log
+.cache
+
+
+# Local configuration (the tracked example documents the schema)
+config/*
+!config/config.example.yaml
+
+# Secrets / local environment
+.env
+.env.*
+
+# Editors: keep shared workspace settings, ignore personal overrides
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# OS noise
+.DS_Store
+
+config/
