@@ -40,5 +40,3 @@ config/*
 
 # OS noise
 .DS_Store
-
-config/

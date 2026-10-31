@@ -23,7 +23,7 @@ class SystemConfig:
 
     config = {}
 
-    VERSION = "1.0.0"
+    VERSION = "0.1.0"
 
     @staticmethod
     def generateDefaultConfig() -> dict:
@@ -154,5 +154,5 @@ class SystemConfig:
             ]["version"]
         except Exception as e:
             logger_mp.error(f"[Config] Error occurred while loading configuration: {e}")
-            SystemConfig.VERSION = "1.0.0"
+            SystemConfig.VERSION = "0.1.0"
             return None

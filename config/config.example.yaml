@@ -1,0 +1,9 @@
+# Copy this file to config/config.yaml and edit it.
+# config/config.yaml is gitignored because it holds machine-specific settings
+# (Bluetooth address, MQTT credentials, soundbar inputs).
+#
+# Keep this example free of real credentials and MAC addresses: it is the
+# tracked schema that agents and humans use to discover config keys.
+settings:
+    # Placeholder flag used by the scaffold tests; safe to ignore.
+    test: true

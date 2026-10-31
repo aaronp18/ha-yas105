@@ -27,7 +27,9 @@ class Main:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Playlist Generator CLI tool.")
+    parser = argparse.ArgumentParser(
+        description="Yamaha YAS-105 soundbar <-> Home Assistant bridge."
+    )
 
     subparsers = parser.add_subparsers(
         dest="command", required=True, help="Available commands"
@@ -41,8 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def get_version() -> str:
-    """Return the version."""
-    return SystemConfig.VERSION
+    """Return the installed package version, falling back to the source constant."""
+    try:
+        return metadata_version("ha-yas105")
+    except PackageNotFoundError:
+        return SystemConfig.VERSION
 
 
 def main(argv: list[str] | None = None, app: Main | None = None) -> int:

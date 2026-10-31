@@ -1,17 +1,43 @@
 [project]
 name = "ha-yas105"
 version = "0.1.0"
-description = "Add your description here"
+description = "Control a Yamaha YAS-105 soundbar from Home Assistant over Bluetooth RFCOMM and MQTT"
 readme = "README.md"
 authors = [
     { name = "Aaron", email = "hourglassprograms@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0.3",
+]
 
 [project.scripts]
-ha-yas105 = "ha_yas105:main"
+ha-yas105 = "ha_yas105.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.14.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# The formatter handles line width; long strings/comments are allowed.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ha_yas105"]
