@@ -19,8 +19,10 @@ A bridge between a **Yamaha YAS-105 soundbar** and **Home Assistant**.
 Status: **early scaffold with a protocol lab tool.** `src/ha_yas105` contains the CLI
 entry point, the config loader, a first RFCOMM transport, a hypothesised protocol codec
 (`protocol.py`) and the `probe` menu (`probe.py`). The protocol itself is **not**
-confirmed; the MQTT bridge and the Docker image are still to be written. Do not claim a
-feature exists unless the code for it is in `src/`.
+confirmed, the MQTT bridge is not written, and although `Dockerfile` + `entrypoint.sh`
+exist, `docker-compose.yaml` is empty and the entrypoint targets a `run` subcommand the CLI
+does not have, so there is no working container yet. Do not claim a feature exists unless
+the code for it is in `src/`.
 
 ## Golden rules
 
@@ -63,7 +65,7 @@ feature exists unless the code for it is in `src/`.
 | Show CLI help | `uv run ha-yas105 help` |
 | Probe frames offline (no Bluetooth) | `uv run ha-yas105 probe --dry-run` |
 | Probe the real soundbar | `uv run ha-yas105 probe --address <MAC> --channel <N>` |
-| Build/run container | `docker compose build` / `docker compose up -d` |
+| Build/run container | `docker compose build` / `docker compose up -d` (**not functional yet**: `docker-compose.yaml` is empty, see pitfalls) |
 
 `uv run` is preferred over activating `.venv` so commands work identically for humans
 and agents. The console script `ha-yas105` maps to `ha_yas105.main:main`; the module can
@@ -83,7 +85,8 @@ src/ha_yas105/
   probe.py             ProtocolProbe (numbered terminal menu) + DryRunTransport
   transport/
     __init__.py        Package docstring only
-    rfcomm.py          RfcommTransport + defaultSocketFactory() (Bluetooth Classic RFCOMM),
+    rfcomm.py          RfcommTransport + defaultSocketFactory() (Bluetooth Classic RFCOMM,
+                       libc.connect() fallback when the interpreter has no AF_BLUETOOTH),
                        TransportError
 tests/
   conftest.py          isolated_system_config fixture (temp CWD + patched config path)
@@ -99,6 +102,10 @@ docs/
   yamaha_yas_105_bluetooth_protocol_spec.md
                        Gemini-derived protocol hypothesis. Untrusted source material;
                        `protocol.py` is a direct transcription of it.
+Dockerfile             uv + python3.14-trixie-slim image, non-root `app` user,
+                       ENTRYPOINT = entrypoint.sh
+entrypoint.sh          `run` -> CLI dispatch (the `run` subcommand does not exist yet)
+docker-compose.yaml    Empty placeholder: no service definition yet
 ```
 
 Data flow (target design):
@@ -138,6 +145,29 @@ soundbar:
 - Add planned keys here and to `config/config.example.yaml` when you add them in
   `generateDefaultConfig()`; keep the example credential-free.
 
+## Bluetooth setup contract (pairing is host-owned)
+
+- **Pairing is a one-time, manual host step, never a startup step.** The bar only accepts a
+  new pair while it is in pairing mode, which is entered on the device itself or from the
+  vendor app, so no code in this repo can create a bond. `bluetoothd` stores the link key
+  under `/var/lib/bluetooth/<adapter>/<device>/`, so it survives reboots and container
+  restarts. Startup code must assume `Bonded: yes` and must not attempt to pair.
+- **Never run a second `bluetoothd` in the container, and never bind-mount
+  `/var/lib/bluetooth`.** One daemon owns `hciX`; the bond belongs to the host, and the
+  container has no business rewriting it.
+- **Automatable at startup, and where it belongs:** assert the adapter is up, stop a stray
+  inquiry (`Discovering: yes` competes with the connect), assert `Trusted`, resolve the SPP
+  channel, then connect with retry/backoff. Put that behind an injected seam (subprocess
+  runner or D-Bus client) in `src/ha_yas105/` and call it from `entrypoint.sh`; do not
+  present `docker exec` sequences as the supported path.
+- **Non-root data path is proven, raw/HCI is not.** The RFCOMM connect reaches the kernel as
+  the normal app user on the test host, but the image ships no `bluetoothctl`, `sdptool` or
+  D-Bus client, and the container has no `NET_ADMIN`/`NET_RAW` by default. A preflight needs
+  those packages in the image (BlueZ CLI route) or the BlueZ D-Bus API (`dbus-next`), plus
+  host networking, a `/run/dbus` mount and capabilities.
+- `RfcommTransport` makes exactly one connect attempt bounded by `--timeout`; there is no
+  retry loop yet, which is why a cold page fails after 2 s.
+
 ## Testing conventions
 
 - Use fixtures from `tests/conftest.py`; do not hand-roll `SystemConfig` state.
@@ -174,11 +204,16 @@ soundbar:
   `SystemConfig.VERSION` directly.
 - `logging.basicConfig(level=logging.INFO)` runs at import time in `main.py`. Do not add a
   second `basicConfig` call; configure loggers, not the root, elsewhere.
-- `Dockerfile` and `docker-compose.yaml` are currently **empty placeholders** —
-  `docker compose build` will not produce a working image yet. Dependencies are declared
-  in `pyproject.toml` and pinned in `uv.lock`; `requirements.txt` is only a pointer and
-  must stay that way. Run `uv lock` after editing dependencies and commit the lock file
-  (CI uses `uv sync --locked`).
+- `Dockerfile` and `entrypoint.sh` exist (uv + Python 3.14 slim, non-root `app` user,
+  `ENTRYPOINT ["/app/entrypoint.sh"]`), but `entrypoint.sh` execs
+  `uv run /app/src/ha_yas105/main.py run` while `build_parser()` only knows
+  `help`/`version`/`probe`, and `docker-compose.yaml` is still 0 bytes. So there is no
+  working container yet and a `run` subcommand is a prerequisite for the MQTT bridge.
+  Decide between CLI-based (`bluetoothctl`/`sdptool` in the image) and D-Bus-based
+  (`dbus-next` dependency) Bluetooth automation before adding packages to the image.
+  Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`; `requirements.txt`
+  is only a pointer and must stay that way. Run `uv lock` after editing dependencies and
+  commit the lock file (CI uses `uv sync --locked`).
 - `docs/protocol.md` is the only trustworthy source for the soundbar protocol. Several
   commands are still unknown; see the open questions there.
 - `protocol.py` is a transcription of an AI-generated spec
@@ -186,10 +221,18 @@ soundbar:
   build MQTT/HA behaviour on it until the frames are confirmed with `ha-yas105 probe` and
   recorded in `docs/protocol.md`. The spec contradicts itself about the checksum; see the
   module docstring for the rule that matches its own command table.
-- `socket.AF_BLUETOOTH` does not exist on every platform (e.g. WSL without Bluetooth), so
-  `defaultSocketFactory()` raises `TransportError` there — the probe then tells the user to
-  run on Linux with BlueZ or use `--dry-run`. Tests fake the socket module instead of
-  checking platform support.
+- `socket.AF_BLUETOOTH` is missing from some interpreter builds even on a Bluetooth host.
+  The uv-managed python-build-standalone behind `.venv` and the container image is compiled
+  without the BlueZ headers, so `socket.SOCK_*`/`AF_BLUETOOTH` are absent and
+  `socket.connect()` rejects a Bluetooth address with `bad family` (only CPython's address
+  parsing is missing; the kernel is fine). `defaultSocketFactory()` therefore falls back to
+  `connectWithoutBluetoothSupport()`: it creates the socket with the Linux numbers
+  (`LINUX_AF_BLUETOOTH = 31`, `LINUX_BTPROTO_RFCOMM = 3`) and calls `libc.connect()` with a
+  hand-built `sockaddr_rc` from `packSockaddrRc()`. Keep `libcConnect()` as the patch seam;
+  tests fake it and the `socket` module instead of needing a Bluetooth adapter. Only a
+  kernel without Bluetooth (e.g. WSL) still ends in `TransportError` telling the user to
+  run on Linux with BlueZ or use `--dry-run`. Do not "simplify" this back to a single
+  `socket.socket(...).connect(...)` path.
 
 ## Adding a feature (recipe)
 

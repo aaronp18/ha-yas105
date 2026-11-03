@@ -16,6 +16,8 @@ DEFAULT_PROBE_TIMEOUT = 2.0
 class Main:
     def __init__(self):
 
+        SystemConfig.loadVersion()
+
         logger.info("========================================")
         logger.info("Starting HA-YAS105 Application V" + SystemConfig.VERSION)
         logger.info("========================================")

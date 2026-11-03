@@ -1,3 +1,7 @@
+import errno
+import struct
+from types import SimpleNamespace
+
 import pytest
 
 from ha_yas105.protocol import POWER_QUERY
@@ -5,6 +9,7 @@ from ha_yas105.transport.rfcomm import (
     RfcommTransport,
     TransportError,
     defaultSocketFactory,
+    packSockaddrRc,
 )
 
 STATUS_FRAME = bytes.fromhex("CCAA0900010401050A020000E0")
@@ -14,16 +19,27 @@ ADDRESS = "AA:BB:CC:DD:EE:FF"
 class FakeSocket:
     """Stand-in for a connected RFCOMM socket. Never touches Bluetooth."""
 
-    def __init__(self, chunks=(), connectError=None):
+    def __init__(self, chunks=(), connectError=None, socketError=0):
         self.chunks = list(chunks)
         self.connectError = connectError
+        self.socketError = socketError
         self.sent = []
         self.timeouts = []
+        self.blocking = []
         self.connectedTo = None
         self.closed = False
 
     def settimeout(self, value):
         self.timeouts.append(value)
+
+    def setblocking(self, value):
+        self.blocking.append(value)
+
+    def fileno(self):
+        return 7
+
+    def getsockopt(self, _level, _option):
+        return self.socketError
 
     def connect(self, address):
         if self.connectError is not None:
@@ -179,18 +195,41 @@ def test_default_factory_reports_missing_bluetooth_stack(monkeypatch):
         defaultSocketFactory(ADDRESS, 1, 1.0)
 
 
-def test_default_factory_reports_a_stack_without_af_bluetooth(monkeypatch):
-    class NoBluetoothStack:
-        SOCK_STREAM = 1
-        BTPROTO_RFCOMM = 3
+class BluetoothlessSocketModule:
+    """``socket`` module of an interpreter built without BlueZ support."""
 
-        def socket(self, *_args):  # pragma: no cover - must never be called
-            raise AssertionError("socket() must not be reached")
+    SOCK_STREAM = 1
+    SOL_SOCKET = 1
+    SO_ERROR = 4
 
-    monkeypatch.setattr("ha_yas105.transport.rfcomm.socket", NoBluetoothStack())
+    def __init__(self, sock=None, error=None):
+        self._sock = sock
+        self._error = error
+        self.calls = []
 
-    with pytest.raises(TransportError, match="unavailable on this platform"):
-        defaultSocketFactory(ADDRESS, 1, 1.0)
+    def socket(self, *args):
+        self.calls.append(args)
+        if self._error is not None:
+            raise self._error
+        return self._sock
+
+
+def test_default_factory_delegates_to_libc_without_af_bluetooth(monkeypatch):
+    fallbackCalls = []
+
+    def fallback(address, channel, timeout):
+        fallbackCalls.append((address, channel, timeout))
+        return "connected through libc"
+
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.socket", BluetoothlessSocketModule()
+    )
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.connectWithoutBluetoothSupport", fallback
+    )
+
+    assert defaultSocketFactory(ADDRESS, 2, 0.25) == "connected through libc"
+    assert fallbackCalls == [(ADDRESS, 2, 0.25)]
 
 
 def test_default_factory_wraps_connect_failures(monkeypatch):
@@ -214,3 +253,141 @@ def test_default_factory_returns_a_connected_socket(monkeypatch):
     assert defaultSocketFactory(ADDRESS, 2, 0.25) is sock
     assert sock.connectedTo == (ADDRESS, 2)
     assert sock.timeouts == [0.25]
+
+
+# ---------------------------------------------------------------------------
+# libc fallback for interpreters built without AF_BLUETOOTH (uv's Python 3.14)
+# ---------------------------------------------------------------------------
+
+
+def test_pack_sockaddr_rc_reverses_the_mac_and_uses_linux_family_31():
+    packed = packSockaddrRc(ADDRESS, 3)
+
+    assert packed == struct.pack("<H6sBx", 31, bytes.fromhex("FFEEDDCCBBAA"), 3)
+    assert len(packed) == 10
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["", "AA:BB:CC:DD:EE", "AA:BB:CC:DD:EE:GG", "AA:BB:CC:DD:EE:FFFF", "nonsense"],
+)
+def test_pack_sockaddr_rc_rejects_malformed_addresses(address):
+    with pytest.raises(TransportError, match="invalid Bluetooth address"):
+        packSockaddrRc(address, 1)
+
+
+@pytest.mark.parametrize("channel", [0, -1, 31])
+def test_pack_sockaddr_rc_rejects_channels_outside_1_to_30(channel):
+    with pytest.raises(TransportError, match="invalid RFCOMM channel"):
+        packSockaddrRc(ADDRESS, channel)
+
+
+def test_libc_fallback_connects_with_raw_linux_numbers(monkeypatch):
+    sock = FakeSocket()
+    module = BluetoothlessSocketModule(sock=sock)
+    connects = []
+
+    def fakeLibcConnect(fd, sockaddr):
+        connects.append((fd, sockaddr))
+        return 0
+
+    monkeypatch.setattr("ha_yas105.transport.rfcomm.socket", module)
+    monkeypatch.setattr("ha_yas105.transport.rfcomm.libcConnect", fakeLibcConnect)
+
+    assert defaultSocketFactory(ADDRESS, 3, 0.25) is sock
+    assert module.calls == [(31, 1, 3)]
+    assert connects == [(7, packSockaddrRc(ADDRESS, 3))]
+    assert sock.blocking == [False]
+    assert sock.timeouts == [0.25]
+    assert sock.closed is False
+
+
+def test_libc_fallback_reports_a_kernel_without_bluetooth(monkeypatch):
+    module = BluetoothlessSocketModule(
+        error=OSError(errno.EAFNOSUPPORT, "Address family not supported")
+    )
+    monkeypatch.setattr("ha_yas105.transport.rfcomm.socket", module)
+
+    with pytest.raises(TransportError, match="unavailable on this platform"):
+        defaultSocketFactory(ADDRESS, 1, 0.5)
+
+    assert module.calls == [(31, 1, 3)]
+
+
+def test_libc_fallback_wraps_immediate_connect_errors(monkeypatch):
+    sock = FakeSocket()
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.socket", BluetoothlessSocketModule(sock=sock)
+    )
+    monkeypatch.setattr("ha_yas105.transport.rfcomm.libcConnect", lambda *_: -1)
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.ctypes",
+        SimpleNamespace(get_errno=lambda: errno.EHOSTUNREACH),
+    )
+
+    with pytest.raises(TransportError, match="could not connect to") as excinfo:
+        defaultSocketFactory(ADDRESS, 1, 0.5)
+
+    # strerror() wording is platform specific; the errno is not.
+    assert f"[Errno {errno.EHOSTUNREACH}]" in str(excinfo.value)
+    assert sock.closed is True
+
+
+def test_libc_fallback_times_out_while_the_link_is_pending(monkeypatch):
+    sock = FakeSocket()
+
+    class SilentPoll:
+        def register(self, *_args):
+            pass
+
+        def poll(self, _timeout):
+            return []
+
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.socket", BluetoothlessSocketModule(sock=sock)
+    )
+    monkeypatch.setattr("ha_yas105.transport.rfcomm.libcConnect", lambda *_: -1)
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.ctypes",
+        SimpleNamespace(get_errno=lambda: errno.EINPROGRESS),
+    )
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.select",
+        SimpleNamespace(poll=SilentPoll, POLLOUT=4),
+    )
+
+    with pytest.raises(TransportError, match="timed out connecting") as excinfo:
+        defaultSocketFactory(ADDRESS, 1, 0.5)
+
+    assert "after 0.5s" in str(excinfo.value)
+    assert sock.closed is True
+
+
+def test_libc_fallback_reports_the_socket_error_found_after_polling(monkeypatch):
+    sock = FakeSocket(socketError=errno.ECONNREFUSED)
+
+    class ReadyPoll:
+        def register(self, *_args):
+            pass
+
+        def poll(self, _timeout):
+            return [(7, 4)]
+
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.socket", BluetoothlessSocketModule(sock=sock)
+    )
+    monkeypatch.setattr("ha_yas105.transport.rfcomm.libcConnect", lambda *_: -1)
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.ctypes",
+        SimpleNamespace(get_errno=lambda: errno.EINPROGRESS),
+    )
+    monkeypatch.setattr(
+        "ha_yas105.transport.rfcomm.select",
+        SimpleNamespace(poll=ReadyPoll, POLLOUT=4),
+    )
+
+    with pytest.raises(TransportError, match="could not connect to") as excinfo:
+        defaultSocketFactory(ADDRESS, 1, 0.5)
+
+    assert f"[Errno {errno.ECONNREFUSED}]" in str(excinfo.value)
+    assert sock.closed is True

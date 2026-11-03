@@ -13,9 +13,29 @@ here because it "seems likely" — if it is a hypothesis, put it under
 | --- | --- |
 | Control link is Bluetooth Classic Serial Port Profile (RFCOMM), i.e. a byte stream, not BLE GATT and not IP. | Project premise in `README.md`; the soundbar advertises itself over Classic Bluetooth. |
 | The container therefore needs access to the host Bluetooth stack (D-Bus) and to the paired device. | Requirement, see `AGENTS.md`. |
+| The soundbar advertises Serial Port Profile (UUID `0x1101`) next to A2DP/Audio Sink. | `bluetoothctl info <MAC>` on the Linux host, 2026-10-31: UUID `00001101-0000-1000-8000-00805f9b34fb` listed. The channel number is still unknown. |
 
 Everything else — RFCOMM channel, framing, command set, response format, keepalive — is
 still unknown. Do not implement against a guess.
+
+## Link prerequisites (host side)
+
+Not frame bytes, but the probe cannot produce protocol data until these hold. They live
+here because "the connect timed out" is easy to misread as a protocol or interpreter
+problem.
+
+| Fact | Evidence |
+| --- | --- |
+| While it is unbonded, the bar does not answer SDP/RFCOMM: `sdptool browse <MAC>` prints only `Browsing <MAC> ...` and returns nothing for 45 s, and `ha-yas105 probe` ends in `timed out connecting to <MAC> on RFCOMM channel 1 after 2s`. | 2026-10-31, host `hci0` (`comet`), BlueZ 5.72; `bluetoothctl info`: `Paired: no`, `Bonded: no`, `Trusted: no`, `Connected: no`. |
+| That silence is peer-side, not a local permission problem: the control test `sdptool browse 11:22:33:44:55:66` (no such device) fails immediately with `Failed to connect to SDP server ... Host is down`. Raw SDP therefore works from an unprivileged session on this host (no file caps on the BlueZ tools, user not in the `bluetooth` group). | Same session, 2026-10-31. |
+| Pairing is a one-time manual step: the bar only accepts a new pair while it is in pairing mode, which is entered on the bar itself (BLUETOOTH key) or from the vendor app. No container or Python startup code can open that window, so automation has to treat pairing as already done. | Operational constraint. |
+| The bond is host state: `bluetoothd` keeps the link key under `/var/lib/bluetooth/<adapter>/<device>/` (root-only), so it survives reboots and container restarts. A container must not mount/rewrite that directory and must not run a second `bluetoothd`; one daemon owns `hciX`. | BlueZ storage layout; `/var/lib/bluetooth` is not readable by the app user on the test host. |
+| An active inquiry competes with the connect: `hciconfig -a` showed `Discovering: yes` while the probe timed out. Stop it (`bluetoothctl scan off`) before connecting. | 2026-10-31. |
+| The bar may not even be known to the adapter yet: `bluetoothctl info <MAC>` answered `Device ... not available` and `bluetoothctl devices` was empty until `bluetoothctl scan on` had run once. | 2026-10-31. |
+
+Not yet shown: whether `Trusted: yes` is required in addition to `Bonded: yes`, whether the
+bar needs an authenticated/encrypted SPP link, and whether it accepts SPP while an A2DP
+link is up. See [Open questions](#open-questions).
 
 ## Unverified hypothesis: the AI-generated spec
 
@@ -80,19 +100,28 @@ Read the output like this:
 - `checksum: valid` / `checksum: INVALID with the spec's formula` — tells you whether the
   status frame checksum matches the two's-complement prose formula (still untested).
 
-Pair and trust the soundbar first (`bluetoothctl`), and make sure nothing else holds the
+Pair and trust the soundbar first (`bluetoothctl`, see
+[Link prerequisites](#link-prerequisites-host-side)), and make sure nothing else holds the
 link: an open Yamaha app session or a running `rfcomm bind` will make `connect` fail with
 "device or resource busy". Copy the raw `TX`/`RX` lines into the capture log below.
+`--timeout` also bounds the initial connect, so use a larger value if paging the soundbar
+takes longer than 2 s. On a host whose Python was built without BlueZ headers (the uv
+Python used here) the transport connects through `libc` instead of `socket.AF_BLUETOOTH`;
+that is a transport detail, not protocol behaviour.
 
 ## How to discover commands
 
-1. Pair and trust the soundbar from the host (Bluetooth must not be claimed by another
-   client; the Yamaha app or a phone holding the link will block you):
+1. Pair and trust the soundbar from the host, once. The bar only accepts a new pair while it
+   is in pairing mode, so this step needs a hand on the device; the bond is then kept by the
+   host (see [Link prerequisites](#link-prerequisites-host-side)) and does not have to be
+   repeated for every container start. Bluetooth must also not be claimed by another client:
+   the Yamaha app or a phone holding the link will block you.
 
    ```bash
    bluetoothctl scan on          # note the device MAC
    bluetoothctl pair   <MAC>
    bluetoothctl trust  <MAC>
+   bluetoothctl scan off         # an active inquiry competes with the connect
    bluetoothctl connect <MAC>
    ```
 
@@ -132,13 +161,52 @@ Add one entry per session, newest first:
   ...
 ```
 
+## 2026-10-31 - first connection attempt with ha-yas105 probe (Linux host, BlueZ 5.72)
+
+- Method: `ha-yas105 probe` (connect only, no frame sent), plus `bluetoothctl info <MAC>`
+  and `sdptool browse <MAC>`
+- Channel: 1 (from the hypothesis, not confirmed)
+- Raw: no frames captured. The RFCOMM connect did not complete within 2 s or 12 s, and
+  `sdptool browse` failed with `Failed to connect to SDP server ... Software caused
+  connection abort`.
+- `bluetoothctl info <MAC>` at the same time: `Paired: no`, `Bonded: no`, `Connected: yes`
+  (A2DP), SPP UUID `0x1101` advertised.
+- Interpretation (hypothesis, mark clearly): the soundbar was holding an audio link and is
+  not bonded, so it did not answer the SPP connect. Pair + trust it, disconnect the audio
+  source, and retry with `--timeout 10` before drawing any protocol conclusion.
+- Follow-up on the same day, same host (adapter `hci0`, name `comet`, BlueZ 5.72):
+  - `bluetoothctl info <MAC>` answered `Device ... not available` and `bluetoothctl devices`
+    was empty: the soundbar had never been seen by this adapter, so it is not in the BlueZ
+    cache. Only after `bluetoothctl --timeout 12 scan on` did it show up as
+    `YAS-105  Yamaha`, class `0x00240414`. State at that point: `Paired: no`,
+    `Bonded: no`, `Trusted: no`, `Connected: no`.
+  - `sdptool browse <MAC>` still printed only `Browsing <MAC> ...` and returned no records
+    after 45 s, i.e. the remote SDP/RFCOMM connect is not answered at all. So the probe's
+    `timed out connecting ... after 2s` is a peer-side/bonding problem, **not** an
+    interpreter problem: the `libc` connect fallback used on builds without
+    `socket.AF_BLUETOOTH` does reach the kernel (a missing socket family would fail
+    immediately with "Bluetooth RFCOMM sockets are unavailable" instead of timing out).
+  - Control test for the silence: `sdptool browse 11:22:33:44:55:66` (no such device)
+    returned `Failed to connect to SDP server on 11:22:33:44:55:66: Host is down` at once,
+    so the local SDP path works and only the bar fails to answer. `hciconfig -a` during the
+    attempts: `UP RUNNING`, `Discovering: yes`.
+  - Still no frames captured, so no protocol conclusion; channel remains unknown.
+
 ## Open questions
 
 Answer these with `ha-yas105 probe` and write the result into the capture log above; move
 a row from the hypothesis table into [Confirmed](#confirmed) only when the frame was
 actually seen working on a device.
 
-- [ ] Which RFCOMM channel does the YAS-105 expose? (`sdptool browse <MAC>`)
+- [ ] Which RFCOMM channel does the YAS-105 expose? (`sdptool browse <MAC>` — it returns
+      nothing until the host is bonded, so pair first)
+- [ ] Does the bar require `Bonded: yes` (authenticated/encrypted link), or does it accept
+      an anonymous RFCOMM connect once nothing else holds it? Does `Trusted: yes` add
+      anything on top of `Bonded: yes`?
+- [ ] Which pairing flavour does the bar use — SSP "Just Works", or legacy PIN (and which
+      PIN)? This decides whether unattended pairing could ever be scripted.
+- [ ] Does the bar accept the SPP link while an A2DP connection is up, or is it one
+      connection at a time?
 - [ ] Is the protocol line-based ASCII (many Yamaha devices are) or binary with a
       length/checksum frame (`CC AA …`)?
 - [ ] Does the soundbar accept `CC AA 03 00 01 00 2E` (spec table checksum) or the
